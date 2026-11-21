@@ -307,6 +307,10 @@ class CAMKernel(nn.Module):
             sim = np.asarray(kern.transform(masks),dtype=np.float64)
             if sim.shape != (len(masks),len(graphs)):
                 raise RuntimeError('unexpected GraKeL kernel output shape: '+str(sim.shape))
+            # Normalized kernels give 0/0 = NaN when a graph has an empty feature
+            # vector (e.g. 'gl' on graphs smaller than its graphlet size). That
+            # means "no shared features": 0, as original GKNN's np.nan_to_num.
+            sim = np.where(np.isnan(sim), 0.0, sim)
             if not np.isfinite(sim).all():
                 raise FloatingPointError('nonfinite GraKeL kernel evaluation for '+name)
             sims_by_kernel.append(sim[gather].reshape(B,self.filters,len(graphs)))

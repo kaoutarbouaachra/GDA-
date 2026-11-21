@@ -3,7 +3,9 @@ import torch
 from torch import nn
 import torch_geometric
 import torch_geometric.utils as utils
-from grakel.kernels import WeisfeilerLehman, VertexHistogram
+from grakel.kernels import (WeisfeilerLehman, VertexHistogram,
+                            WeisfeilerLehmanOptimalAssignment, Propagation,
+                            GraphletSampling, RandomWalkLabeled, PyramidMatch)
 import scipy
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
@@ -175,16 +177,18 @@ class GKernelConv(torch.autograd.Function):
 
         
         if not stored:
+          if not isinstance(gk, (WeisfeilerLehman, WeisfeilerLehmanOptimalAssignment)):
+              # GraKeL's gl/prop/rw/py reject edgeless graphs (isolated-node egonets).
+              # Same convention as max_comp uses for edgeless masks: self-loops.
+              # WL kernels accept them, so their behaviour is left unchanged.
+              Gs1 = [[E if len(E) else set((k, k) for k in d), d] for E, d in Gs1]
           gk.fit(Gs1)
           try:
               sim = gk.transform(Gs2)
-          except:
-              print('---------------------------------------------------------')
-              print(Gs1)
-              print('---------------------------------------------------------')
-              print(Gs2)
-              print('---------------------------------------------------------')
-              input('stopping here for inpsection')
+          except Exception as exc:
+              # Fail loudly: an input() pause would hang/EOF on a cluster node.
+              raise RuntimeError('GraKeL transform failed for %s on %d masks vs %d egonets; masks=%r'
+                                 % (type(gk).__name__, len(Gs2), len(Gs1), Gs2)) from exc
           sim = np.nan_to_num(sim)
         else:
           sim = gk.transform(Gs2)

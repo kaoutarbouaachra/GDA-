@@ -1,3 +1,4 @@
+from argparse import Namespace
 import numpy as np
 import torch
 from torch import nn
@@ -12,6 +13,7 @@ from cam import CAMKernel
 import scipy
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
+from scipy.cluster.vq import kmeans2
 import time
 
 
