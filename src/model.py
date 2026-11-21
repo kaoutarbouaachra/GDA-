@@ -8,6 +8,7 @@ from grakel.kernels import (WeisfeilerLehman, VertexHistogram,
                             Propagation, GraphletSampling, 
                             RandomWalkLabeled, PyramidMatch)
 from layers import *
+from cam import CAMKernel
 import scipy
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
@@ -40,49 +41,66 @@ def jsd_paper(R, batch):
     H_M = -global_add_pool(M * M.clamp_min(1e-12).log(), batch)[:, 0]  # [G]
     return (H_M - H_i.mean(-1)).mean()
 
-LOGDET_EPS = 1e-4      # default epsilon in log det(C + eps I)
-CONST_STD = 1e-6       # a filter whose response std over the batch is below this is "collapsed"
+LOGDET_EPS = 1e-4
+CONST_STD = 1e-6
 
 
 def correlation_matrix(R, const_std=CONST_STD):
-    """Pearson correlation between the columns (filters) of R [N, m].
-
-    1. centre each column, 2. divide by its norm -> U, 3. C = U^T U.
-    Collapsed (nearly constant) columns have no defined correlation: their
-    column of U is set to exactly 0, so their row/column of C is 0 (diag 0).
-    The active/collapsed decision is not differentiated, and dividing only by
-    norms above the threshold keeps 1/norm bounded (no exploding gradients).
-    Returns C [m, m] and the boolean mask of active columns.
-    """
+    """Empirical Pearson correlation; inactive columns have zero rows/cols."""
     Rc = R - R.mean(0, keepdim=True)
-    norm = Rc.norm(dim=0, keepdim=True)                       # [1, m]
-    active = (Rc.detach().std(0, unbiased=False) > const_std)  # [m]
+    norm = Rc.norm(dim=0, keepdim=True)
+    active = Rc.detach().std(dim=0, unbiased=False) > const_std
     U = torch.where(active[None, :], Rc / norm.clamp_min(EPS), torch.zeros_like(Rc))
     return U.t() @ U, active
 
 
 def logdet_penalty(R, batch=None, eps=LOGDET_EPS, const_std=CONST_STD):
-    """L_logdet(R) = -(1/m) log det(C + eps I_m), C = correlation matrix of the filters.
+    """Collective diversity loss: -logdet(C + eps I) / m.
 
-    C is PSD with unit diagonal for active filters, so det(C) <= 1 and the loss
-    is >= -log(1+eps) ~ 0, with equality iff the filters are uncorrelated.
-    Every redundant direction (eigenvalue of C near 0) costs up to -log(eps)/m;
-    a collapsed filter (zero row in C) costs exactly -log(eps)/m, with no gradient.
-    The determinant is never formed: log det = 2 sum log diag(chol(C + eps I)),
-    computed in float64 (slogdet as a fallback).
+    Note: inactive filters are measured, not automatically prevented.
     """
     m = R.shape[-1]
     if m < 2:
         return R.sum() * 0
     C, _ = correlation_matrix(R, const_std)
     C = C.double()
-    A = 0.5 * (C + C.t()) + eps * torch.eye(m, dtype=C.dtype, device=C.device)
+    A = 0.5*(C+C.t()) + eps*torch.eye(m, dtype=C.dtype, device=C.device)
     L, info = torch.linalg.cholesky_ex(A)
     if int(info) == 0:
-        logdet = 2 * torch.log(torch.diagonal(L)).sum()
-    else:                                     # not reachable for eps > 0; kept as a guard
-        logdet = torch.linalg.slogdet(A)[1]
-    return (-logdet / m).to(R.dtype)
+        logdet = 2*torch.log(torch.diagonal(L)).sum()
+    else:
+        sign, logdet = torch.linalg.slogdet(A)
+        if sign <= 0:
+            raise RuntimeError('Non-positive determinant in logdet_penalty')
+    return (-logdet/m).to(R.dtype)
+
+
+
+
+def _cam_or_gkernel(hparams, layer_index, nodes, labels, filters, **kwargs):
+    """Preserve original GKNN; choose connected CAM on request."""
+    mode = getattr(hparams, "mask_distribution", "original")
+    if mode == "original":
+        return GKernel(nodes, labels, filters, **kwargs)
+    if mode != "cam":
+        raise ValueError("Invalid mask_distribution: " + str(mode))
+    # For layer>=2, soft categorical node labels let gradients propagate
+    # to previous layers; this is a documented extension of original GKNN.
+    layer_index = int(layer_index)
+    kernel_names = str(getattr(hparams, "kernel", "wl")).split("+")
+    if layer_index > 0 and len(kernel_names) != 1:
+        raise ValueError("Multilayer CAM currently requires exactly one graph kernel")
+    return CAMKernel(
+        nodes, labels, filters,
+        mc_samples=int(getattr(hparams, "cam_samples", 8)),
+        eval_samples=int(getattr(hparams, "cam_eval_samples", 32)),
+        initial_stop_prob=float(getattr(hparams, "cam_initial_stop_prob", 0.1)),
+        eval_seed=int(getattr(hparams, "cam_eval_seed", 1729)) + layer_index,
+        input_label_mode="argmax" if layer_index == 0 else "categorical",
+        input_temperature=float(getattr(hparams, "cam_input_temperature", 1.0)),
+        **kwargs,
+    )
+
 
 class Model(pl.LightningModule):
     def __init__(self, hparams):
@@ -102,11 +120,11 @@ class Model(pl.LightningModule):
         self.conv_layers = nn.ModuleList()
         self.vq_layers =nn.ModuleList()
     
-        self.conv_layers.append(GKernel(hparams.nodes,labels,hidden,max_cc=self.hparams.max_cc,hops=hparams.hops, kernels=hparams.kernel, store_fit=True))
+        self.conv_layers.append(_cam_or_gkernel(hparams, 0, hparams.nodes, labels, hidden,max_cc=self.hparams.max_cc,hops=hparams.hops, kernels=hparams.kernel, store_fit=True))
         
         n_kernels = len(hparams.kernel.split('+'))
         for i in range(1, hparams.layers):
-            self.conv_layers.append(GKernel(hparams.nodes,hidden,hidden,max_cc=self.hparams.max_cc,hops=hparams.hops, kernels=hparams.kernel))
+            self.conv_layers.append(_cam_or_gkernel(hparams, i, hparams.nodes, hidden, hidden,max_cc=self.hparams.max_cc,hops=hparams.hops, kernels=hparams.kernel))
             
             self.vq_layers.append(SoftAss(hidden, hidden))
         
@@ -137,7 +155,7 @@ class Model(pl.LightningModule):
                 return -reg_weight * jsd_code(x, batch)
             if reg_type == 'jsd_paper':     # maximise diversity -> minus sign
                 return -reg_weight * jsd_paper(x, batch)
-            if reg_type == 'logdet':        # loss is already -log det -> plus sign
+            if reg_type == 'logdet':
                 return reg_weight * logdet_penalty(x, batch, eps=logdet_eps)
             if reg_type == 'none':
                 return x.sum() * 0
@@ -159,9 +177,9 @@ class Model(pl.LightningModule):
 
     def forward(self, data):
     
-        # PyG 2.x stores attributes outside __dict__, and setting one to None deletes it
+        # PyG stores Data properties outside __dict__.
         nidx = getattr(data, 'nidx', None)
-
+            
         batch=data.batch
         edge_index=data.edge_index
         x=data.x
@@ -239,16 +257,10 @@ class Model(pl.LightningModule):
         with torch.no_grad():
             # share of responses < 0 (zeroed by the clamp in jsd_paper, so no gradient there)
             frac_neg = torch.stack([(x < 0).float().mean() for x in responses]).mean()
-            # share of collapsed (near-constant) filters, same threshold as logdet_penalty
-            corr = [correlation_matrix(x) for x in responses]
-            frac_const = torch.stack([(~a).float().mean() for _, a in corr]).mean()
-            # smallest eigenvalue of C over the active filters: ~0 = near-singular (redundant)
-            min_eig = torch.stack([
-                torch.linalg.eigvalsh(C[a][:, a].double()).min().float() if a.sum() > 1
-                else C.new_tensor(float('nan')) for C, a in corr]).nanmean()
+            # Monitor constant filters separately from the determinant penalty
+            frac_const = torch.stack([(~correlation_matrix(x)[1]).float().mean() for x in responses]).mean()
         self.log('frac_neg_resp', frac_neg.item(), on_step=False, on_epoch=True)
         self.log('frac_const_filters', frac_const.item(), on_step=False, on_epoch=True)
-        self.log('corr_min_eig', min_eig.item(), on_step=False, on_epoch=True)
         self.log('loss_ce', loss_ce.item(), on_step=False, on_epoch=True)
 #         self.log('loss_spa', loss_spa.item(), on_step=False, on_epoch=True)
 
