@@ -33,6 +33,16 @@ def motif_graph(name):
     return nx.convert_node_labels_to_integers(g)
 
 
+def motif_radius(name):
+    """Smallest egonet radius r for which SOME vertex's r-hop egonet contains the
+    whole motif (graph radius). ring=4, wheel=1, grid=2, ladder=3, cliques=2."""
+    return int(nx.radius(motif_graph(name)))
+
+
+def required_hops(names):
+    return max(motif_radius(n) for n in names)
+
+
 def graph_with_same_nodes_edges_but_different(target,rng):
     n,m=target.number_of_nodes(),target.number_of_edges()
     for _ in range(2000):
@@ -63,7 +73,8 @@ def generate_one(names, label, rng, p_base, p_attach, base_min, base_max):
         g.add_edges_from(attach)
         motifs[name]=dict(present=bool(present),nodes=nodes if present else [],
                           block_nodes=nodes,template_edges=target.number_of_edges(),
-                          template_nodes=target.number_of_nodes())
+                          template_nodes=target.number_of_nodes(),
+                          radius=motif_radius(name))
     return dict(n_nodes=g.number_of_nodes(),edges=[list(e) for e in sorted(g.edges())],
                 label=label,n_base_nodes=base_n,motifs=motifs,
                 n_edges=g.number_of_edges())
@@ -101,6 +112,8 @@ def main():
         for record in records:
             f.write(json.dumps(record,sort_keys=True)+'\n')
     print(f'Saved {len(records)} labelled graphs in {out}. This is a NEW synthetic protocol.')
+    print(f'Egonets must have radius >= {required_hops(names)} (--hops) to contain the whole motif; '
+          f'masks need >= {max(motif_graph(n).number_of_nodes() for n in names)} nodes (--nodes).')
 
 
 if __name__=='__main__':

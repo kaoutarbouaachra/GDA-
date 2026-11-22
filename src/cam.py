@@ -48,6 +48,41 @@ class CAMTrace:
         return (self.size, self.edges, self.labels)
 
 
+class _GKNNInputGradient(torch.autograd.Function):
+    """Identity on the layer output; gradient wrt the INPUT node features x
+    computed with the ORIGINAL GKNN estimator (layers.GKernelConv.backward,
+    'derivative wrt input features': 3 random label edits of x, kernel
+    re-evaluated with the masks held fixed), here using this batch's CAM mask
+    samples. Used for layers >= 2 so CAM and GKNN share the same forward
+    (argmax labels) and the same inter-layer gradient path; only the mask
+    distribution differs.
+    """
+    @staticmethod
+    def forward(ctx, out, x, layer, traces, node_lists, edge_lists, batch, conv):
+        ctx.save_for_backward(x, conv)
+        ctx.layer, ctx.traces = layer, traces
+        ctx.node_lists, ctx.edge_lists, ctx.batch = node_lists, edge_lists, batch
+        return out.view_as(out)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        from layers import GKernelConv
+        x, conv = ctx.saved_tensors
+        xd = x.detach()
+        grad_x = torch.zeros_like(xd)
+        sig = xd.sigmoid() * (1 - xd.sigmoid())
+        for _ in range(3):  # same number of samples as original GKNN
+            _, xpnew, _ = GKernelConv.random_edit(-1, None, None, xd, xd, False, 1,
+                                                  temp=0.1, batch=ctx.batch)
+            egos = ctx.layer._grakel_inputs(xpnew.argmax(-1).numpy(), ctx.node_lists, ctx.edge_lists)
+            convnew = torch.as_tensor(ctx.layer._evaluate(ctx.traces, egos).mean(0), dtype=conv.dtype)
+            proj = ((conv - convnew) * grad_output).sum(0)[:, None, None]
+            # GKNN returns proj*(x-xpnew)*sig with shape [F,N,L], reduced by autograd's
+            # sum_to; the explicit sum over F below is the same quantity.
+            grad_x = grad_x + (proj * (xd - xpnew) * sig).sum(0)
+        return grad_output, grad_x, None, None, None, None, None, None
+
+
 class CAMKernel(nn.Module):
     """A GKNN graph-kernel convolution with a CAM distribution per filter.
 
@@ -68,8 +103,14 @@ class CAMKernel(nn.Module):
                  eval_seed: int = 1729,
                  input_label_mode: str = 'argmax',
                  input_temperature: float = 1.0,
-                 kernel_factories: Optional[Dict[str, Callable]] = None):
+                 kernel_factories: Optional[Dict[str, Callable]] = None,
+                 input_gradient: Optional[str] = None):
         super().__init__()
+        if input_gradient not in (None, 'gknn'):
+            raise ValueError("input_gradient must be None or 'gknn'")
+        if input_gradient == 'gknn' and input_label_mode != 'argmax':
+            raise ValueError("input_gradient='gknn' requires input_label_mode='argmax'")
+        self.input_gradient = input_gradient
         if min(nodes, labels, filters, mc_samples, eval_samples) < 1:
             raise ValueError('nodes, labels, filters and sample counts must be >= 1')
         if not 0 < initial_stop_prob < 1:
@@ -373,6 +414,11 @@ class CAMKernel(nn.Module):
                 # For each v, K(T,Y_ego_v) has expectation differentiated wrt x.
                 input_surrogate = (centered_values*input_scores[:,:,None]).mean(dim=0)
                 out = out + input_surrogate - input_surrogate.detach()
+            if self.input_gradient == 'gknn' and x.requires_grad:
+                if batch is None:
+                    raise ValueError("input_gradient='gknn' needs the batch vector")
+                out = _GKNNInputGradient.apply(out, x, self, mask_traces, node_lists,
+                                               edge_lists, batch, mean_values.detach())
         else:
             out = mean_values.detach()
         with torch.no_grad():

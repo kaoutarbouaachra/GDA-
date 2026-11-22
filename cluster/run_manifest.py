@@ -45,7 +45,7 @@ def main():
         return
     # Use unique stdout/err paths; no collision between array tasks.
     dest.mkdir(parents=True,exist_ok=True)
-    with (dest/'job_stdout.log').open('w',encoding='utf-8') as log:
+    with (dest/'job_stdout.log').open('a',encoding='utf-8') as log:  # append across resumes
         p=subprocess.run(cmd,stdout=log,stderr=subprocess.STDOUT,env=os.environ.copy(),check=False)
     print('Completed with exit code',p.returncode,flush=True)
     if p.returncode!=0:

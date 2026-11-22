@@ -64,6 +64,10 @@ def arguments():
     p.add_argument('--cam_initial_stop_prob',type=float,default=0.1)
     p.add_argument('--cam_eval_seed',type=int,default=1729)
     p.add_argument('--cam_input_temperature',type=float,default=1.0)
+    p.add_argument('--cam_multilayer_inputs',choices=('gknn','categorical'),default='gknn',
+                   help="CAM layers>=2: 'gknn' = argmax labels + original GKNN input-gradient "
+                        "estimator (same as GKNN; only masks differ). 'categorical' = legacy "
+                        "softmax-sampled labels")
     p.add_argument('--eval_batch_size',type=int,default=8)
     p.add_argument('--probe_graphs',type=int,default=4)
     p.add_argument('--snapshot_epochs',default='0,1,4,9,24,49,99,199')
@@ -82,7 +86,26 @@ def arguments():
     p.add_argument('--benchmark_warmup',type=int,default=2)
     p.add_argument('--benchmark_repeats',type=int,default=5)
     p.add_argument('--disable_probes',action='store_true')
+    p.add_argument('--resume',action=argparse.BooleanOptionalAction,default=True,
+                   help='If --output holds an interrupted run with checkpoints/last.ckpt, '
+                        'continue it (model, optimizer, early-stopping and best-checkpoint '
+                        'state are restored; global RNG streams are not)')
     return p
+
+
+def _truncate_epochs_csv(path, last_done_epoch):
+    """Drop rows of epochs after the checkpoint we resume from (they will be redone)."""
+    import csv
+    if not path.exists():
+        return
+    with path.open(newline='',encoding='utf-8') as f:
+        rows=list(csv.DictReader(f))
+    keep=[r for r in rows if int(r['epoch'])<=last_done_epoch]
+    if len(keep)!=len(rows):
+        with path.open('w',newline='',encoding='utf-8') as f:
+            w=csv.DictWriter(f,fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(keep)
 
 
 def split_indices(dataset, labels, folds, fold, reuse=True):
@@ -138,9 +161,26 @@ def main():
     if out.exists() and (out/'DONE.json').exists():
         print('Already finished, refusing to overwrite:',out)
         return
+    resume_ckpt=None
     if out.exists() and (out/'config.json').exists():
-        raise SystemExit('Output directory already contains a run. Choose a new --output: '+str(out))
+        # A previous attempt was interrupted (e.g. SLURM time limit).
+        stored=json.loads((out/'config.json').read_text(encoding='utf-8'))['configuration']
+        cli={k:v for k,v in vars(args).items() if k not in ('output','resume')}
+        diff={k:(stored.get(k),v) for k,v in cli.items() if k in stored and stored.get(k)!=v}
+        last=out/'checkpoints'/'last.ckpt'
+        if not args.resume:
+            raise SystemExit('Output directory already contains a run (use --resume): '+str(out))
+        if diff:
+            raise SystemExit('Cannot resume, configuration differs from the stored run: %s' % diff)
+        if last.is_file():
+            resume_ckpt=last
+            print('RESUMING interrupted run from',last)
+        elif (out/'epochs.csv').exists():
+            raise SystemExit('Interrupted run has epochs but no last.ckpt; move it away: '+str(out))
+        else:
+            print('Restarting run interrupted before its first epoch:',out)
     out.mkdir(parents=True,exist_ok=True)
+    (out/'FAILED.json').unlink(missing_ok=True)  # stale marker from an earlier attempt
     (out/'RUNNING').write_text('running\n',encoding='utf-8')
     t0=time.perf_counter()
     try:
@@ -157,8 +197,16 @@ def main():
         (tr,va,te),split_source=split_indices(args.dataset,y,args.folds,args.fold,args.reuse_existing_folds)
         if args.synthetic_path:
             # Save exact inserted motif locations for later node-response analysis.
+            sys.path.insert(0,str(Path(__file__).resolve().parent/'scripts'))
+            from generate_motifs import required_hops
+            motif_names=sorted(ds.records[0]['motifs'])
+            need=required_hops(motif_names)
+            if args.hops<need:
+                print(f'WARNING: hops={args.hops} < {need}: no egonet contains the whole motif')
             write_json(out/'synthetic_ground_truth.json',
                        dict(source=args.synthetic_path,
+                            motif_visibility=dict(motifs=motif_names,required_hops=need,
+                                                  hops=args.hops,whole_motif_visible=args.hops>=need),
                             train={str(i):ds.records[int(i)]['motifs'] for i in tr},
                             val={str(i):ds.records[int(i)]['motifs'] for i in va},
                             test={str(i):ds.records[int(i)]['motifs'] for i in te}))
@@ -191,8 +239,18 @@ def main():
                       split_source=split_source)
         write_json(out/'config.json',metadata)
         model=Model(args)
-        # Initial distribution/mask state, before any training steps.
-        save_mask_snapshot(model,out/'snapshots',-1,cam_graph_samples=args.cam_graph_samples)
+        if resume_ckpt is None:
+            # Initial distribution/mask state, before any training steps.
+            save_mask_snapshot(model,out/'snapshots',-1,cam_graph_samples=args.cam_graph_samples)
+        else:
+            done_epoch=int(torch.load(resume_ckpt,map_location='cpu',weights_only=False)['epoch'])
+            _truncate_epochs_csv(out/'epochs.csv',done_epoch)
+            log=out/'resume_log.json'
+            events=json.loads(log.read_text(encoding='utf-8')) if log.exists() else []
+            events.append(dict(resumed_after_epoch=done_epoch,checkpoint=str(resume_ckpt),
+                               time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                               slurm_job=os.environ.get('SLURM_JOB_ID')))
+            write_json(log,events)
         if args.model=='cam' and not hasattr(model.conv_layers[0],'stop_logits'):
             raise RuntimeError('src/model.py not patched for CAM; see README')
         if args.model=='original' and hasattr(model.conv_layers[0],'stop_logits'):
@@ -209,7 +267,15 @@ def main():
                            EarlyStopping(monitor='val_loss',patience=args.patience,mode='min'),recorder],
                            num_sanity_val_steps=0,log_every_n_steps=1,
                            enable_progress_bar=False)
-        trainer.fit(model,train_dataloaders=train_loader,val_dataloaders=val_loader)
+        fit_kwargs={}
+        if resume_ckpt is not None:
+            fit_kwargs['ckpt_path']=str(resume_ckpt)
+            # Our own checkpoint stores hparams objects (e.g. the loss module), which
+            # torch>=2.6's default weights_only=True refuses to unpickle.
+            import inspect
+            if 'weights_only' in inspect.signature(trainer.fit).parameters:
+                fit_kwargs['weights_only']=False
+        trainer.fit(model,train_dataloaders=train_loader,val_dataloaders=val_loader,**fit_kwargs)
         ckpt=checkpoints.best_model_path
         if not ckpt or not Path(ckpt).exists():
             raise RuntimeError('No best checkpoint saved')
@@ -224,6 +290,10 @@ def main():
                      jsd_weight=args.jsd_weight,
                      total_train_seconds=float(time.perf_counter()-t0),
                      outputs={})
+        if (out/'resume_log.json').exists():
+            # total_train_seconds then covers only the last segment; per-epoch
+            # times in epochs.csv are complete.
+            summary['resume_events']=json.loads((out/'resume_log.json').read_text(encoding='utf-8'))
         if args.evaluate_train:
             loader=EgonetLoader(train_data,batch_size=args.eval_batch_size,shuffle=False)
             summary['outputs']['train']=export_predictions_and_responses(

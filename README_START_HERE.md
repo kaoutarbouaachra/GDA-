@@ -367,3 +367,93 @@ contraintes de construction identiques entre GKNN et CAM.
 Ces scripts ne changent pas automatiquement la definition mathematique de
 GKNN ou CAM. Les tests unitaires ont ete executes hors du stack GraKeL/PyG,
 et un entraînement GKNN/CAM complet doit etre valide dans TON environnement.
+
+
+## 9. PROTOCOLE v2 : GKNN + JSD vs CAM + JSD (profondeur et lambda choisis sur validation)
+
+Resume :
+
+- **Seule difference entre les modeles : la loi des masques.** Graphe-noyau WL,
+  readout (concatenation de TOUTES les couches -> somme -> MLP), perte, optimiseur,
+  splits et recherche d'hyperparametres sont identiques.
+- **Perte : CE + lambda * L_JSD**, `L_JSD = -JSD(softmax(R))`, moyenne sur les couches :
+  implementation OFFICIELLE de GKNN (`--reg_type jsd_code`), identique dans
+  `lcosmo/GKNN` et `gdl-unive/Graph-Kernel-Convolution` (verifie par `tests/test_jsd.py`).
+  Elle differe de l'Eq. 4 du papier (normalisation par filtre sur les sommets) ;
+  on suit le code officiel pour les deux modeles. Grille : lambda in {100, 1000, 10000}.
+- **CAM multicouche (couches >= 2)** : labels d'entree = argmax des reponses (comme GKNN)
+  et gradient vers la couche precedente = estimateur original de GKNN
+  (`--cam_multilayer_inputs gknn`, defaut). L'ancien mode echantillonnait les labels
+  dans softmax(reponses), presque uniforme (accord avec argmax 13,3 % vs 12,5 % au hasard).
+- **Selection sur validation uniquement.** Etape 1 : chaque candidat (L, lambda) est entraine
+  sans jamais evaluer le test. Etape 2 (`cluster/select_jsd.py`) : par (dataset, modele,
+  fold, seed, configuration), CE de validation minimale ; `selection.json` est ecrit AVANT
+  l'unique evaluation du test, sur le MEME checkpoint (pas de reentrainement).
+  Profondeur : `--summarize --select_over layers`.
+- **Reprise automatique** : un job tue par la limite de temps reprend depuis
+  `checkpoints/last.ckpt` quand on le resoumet (`run_tracked.py --resume`, defaut).
+
+Experiences : (1) comparaison principale sur **MUTAG, PTC, PROTEINS** (NCI1 retire) ;
+(2) **Figure 8** ; (3) nombre de masques ; (4) profondeur ; (5) budget Monte Carlo de CAM.
+
+**Figure 8 (`scripts/generate_fig8_paired.py`, integre depuis FIG8_GKNN_CAM_JSD_code.zip)** :
+cinq taches binaires SEPAREES (anneau, roue, grille, echelle, cliques ; plus de tache
+anneau+roue), 2000 graphes de 30 a 50 noeuds par tache. Chaque positif et son negatif
+partagent le meme graphe de base, la meme taille et les memes aretes d'attache ; seul le
+motif differe (negatif : graphe connexe non isomorphe, memes noeuds et aretes). Les folds
+sont GROUPES par paire (`data/folds/FIG8_*_folds_10.txt`) : une paire n'est jamais coupee
+entre train, validation et test. Masques <= 10 noeuds ; rayon d'egonet = rayon du motif
+(anneau 4, roue 1, grille 2, echelle 3, cliques 2), le plus petit qui contienne le motif.
+Ce n'est pas le jeu de donnees original des auteurs, mais une reconstruction controlee.
+
+### Lancement sur Kellogg (dans un CLONE SEPARE : les experiences en cours ne sont pas touchees)
+
+```bash
+git clone https://github.com/kaoutarbouaachra/GDA-.git ~/GDA-v2 && cd ~/GDA-v2
+# 1) Activer l'environnement dans cluster/array.slurm ET cluster/select_array.slurm
+mkdir -p cluster/logs
+# 2) Caches des datasets, une seule fois, sur le noeud de login :
+python -c "import sys; sys.path.insert(0,'src'); from dataset import TUDataset; [print(N, len(TUDataset('./data', N, hops=1))) for N in ['MUTAG','PTC','PROTEINS']]"
+# 3) Donnees Figure 8 + tous les manifests (ne soumet rien) :
+bash cluster/make_v2_manifests.sh
+# 4) Etape 1 (entrainements)
+A="-A <ALLOCATION> -p <PARTITION>"
+sbatch $A --time=04:00:00 --array=0-539 cluster/array.slurm cluster/v2_main_MUTAG.jsonl
+sbatch $A --time=08:00:00 --array=0-539 cluster/array.slurm cluster/v2_main_PTC.jsonl
+sbatch $A --time=48:00:00 --array=0-539 cluster/array.slurm cluster/v2_main_PROTEINS.jsonl
+for M in RING WHEEL GRID LADDER CLIQUES; do
+  sbatch $A --time=48:00:00 --array=0-53 cluster/array.slurm cluster/v2_fig8_$M.jsonl
+done
+sbatch $A --time=48:00:00 --array=0-269 cluster/array.slurm cluster/v2_masks.jsonl
+sbatch $A --time=48:00:00 --array=0-269 cluster/array.slurm cluster/v2_depth.jsonl
+sbatch $A --time=08:00:00 --array=0-134 cluster/array.slurm cluster/v2_mc.jsonl
+# 5) Quand les jobs sont termines : resoumettre UNIQUEMENT les non termines (ils reprennent).
+ALL="main_MUTAG main_PTC main_PROTEINS fig8_RING fig8_WHEEL fig8_GRID fig8_LADDER fig8_CLIQUES masks depth mc"
+for m in $ALL; do
+  ids=$(python cluster/unfinished.py --manifest cluster/v2_$m.jsonl)
+  [ -n "$ids" ] && sbatch $A --time=48:00:00 --array=$ids cluster/array.slurm cluster/v2_$m.jsonl
+done
+# 6) Etape 2 (selection + test), quand unfinished.py n'affiche plus rien :
+for DS in MUTAG PTC PROTEINS; do
+  sbatch $A --array=0-179 cluster/select_array.slurm cluster/v2_main_$DS.jsonl results/v2_main_selected
+done
+for M in RING WHEEL GRID LADDER CLIQUES; do
+  sbatch $A --array=0-17 cluster/select_array.slurm cluster/v2_fig8_$M.jsonl results/v2_fig8_selected
+done
+sbatch $A --array=0-89 cluster/select_array.slurm cluster/v2_masks.jsonl results/v2_masks_selected
+sbatch $A --array=0-89 cluster/select_array.slurm cluster/v2_depth.jsonl results/v2_depth_selected
+sbatch $A --array=0-44 cluster/select_array.slurm cluster/v2_mc.jsonl    results/v2_mc_selected
+# 7) Analyses (aucun reentrainement) :
+python scripts/fig8_extended.py --root results/v2_fig8_selected --split test
+python cluster/select_jsd.py --output_root results/v2_main_selected --summarize --select_over layers
+for r in fig8 masks depth mc; do python cluster/select_jsd.py --output_root results/v2_${r}_selected --summarize; done
+python scripts/make_figures.py      --root results/v2_main_selected --out figures/v2_main
+python scripts/aggregate_runtime.py --root results/v2_main_selected --out figures/v2_runtime
+```
+
+Total : 2565 jobs d'entrainement + 855 jobs de selection = 3420 taches SLURM.
+Estimation pire cas (400 epoques, vitesse d'un PC portable) : ~28 000 heures-job
+(principal 8 650, Figure 8 5 750, profondeur 7 250, masques 6 150, Monte Carlo 130).
+Avec ~100 jobs en parallele : ~12 jours (pire cas), ~6 jours si l'arret anticipe divise les
+epoques par deux. Seuls PROTEINS L = 7 et CAM 64 masques peuvent depasser 48 h : ils reprennent
+automatiquement (etape 5). Verifier le budget d'heures-coeur de l'allocation.

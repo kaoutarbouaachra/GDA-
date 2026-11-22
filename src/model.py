@@ -28,7 +28,19 @@ def JSD(x):
 EPS = 1e-8
 
 def jsd_code(R, batch=None):
-    """JSD as in the original code: q_v(i) = softmax_i(R_vi), normalised over FILTERS."""
+    """JSD as in the OFFICIAL GKNN code (lcosmo/GKNN and gdl-unive/Graph-Kernel-Convolution,
+    src/model.py: `-jsd_weight * JSD(x.softmax(-1))`). Used for both GKNN and CAM.
+
+    q_v = softmax_i(R_vi) is a distribution over the m FILTERS for each node v;
+    JSD = H(mean_v q_v) - mean_v H(q_v), over all nodes of the mini-batch
+    (graphs are not separated). Range [0, log m]. Large when each node is
+    claimed by few filters and different nodes by different filters.
+
+    Differs from the paper (Cosmo et al., Eq. 4), which normalises each filter
+    over the VERTICES of a graph and uses sums instead of means: see jsd_paper.
+    Note: softmax depends on the response scale, which includes the learned
+    per-filter `Model.mask` scale, so JSD can also grow by sharpening that scale.
+    """
     return JSD(R.softmax(-1))
 
 def jsd_paper(R, batch):
@@ -86,20 +98,30 @@ def _cam_or_gkernel(hparams, layer_index, nodes, labels, filters, **kwargs):
         return GKernel(nodes, labels, filters, **kwargs)
     if mode != "cam":
         raise ValueError("Invalid mask_distribution: " + str(mode))
-    # For layer>=2, soft categorical node labels let gradients propagate
-    # to previous layers; this is a documented extension of original GKNN.
+    # Layers >= 2 (cam_multilayer_inputs):
+    #  'gknn'        : argmax input labels + the original GKNN input-gradient
+    #                  estimator -> same forward/inter-layer path as GKNN; only
+    #                  the mask distribution differs. Used by the current pipeline.
+    #  'categorical' : (legacy default, kept so older runs/checkpoints reproduce)
+    #                  labels sampled from softmax(x/T) with a score-function
+    #                  gradient; NOT equivalent to GKNN's argmax labels.
     layer_index = int(layer_index)
     kernel_names = str(getattr(hparams, "kernel", "wl")).split("+")
     if layer_index > 0 and len(kernel_names) != 1:
         raise ValueError("Multilayer CAM currently requires exactly one graph kernel")
+    multilayer = str(getattr(hparams, "cam_multilayer_inputs", "categorical"))
+    if multilayer not in ("gknn", "categorical"):
+        raise ValueError("Invalid cam_multilayer_inputs: " + multilayer)
+    deep_gknn = layer_index > 0 and multilayer == "gknn"
     return CAMKernel(
         nodes, labels, filters,
         mc_samples=int(getattr(hparams, "cam_samples", 8)),
         eval_samples=int(getattr(hparams, "cam_eval_samples", 32)),
         initial_stop_prob=float(getattr(hparams, "cam_initial_stop_prob", 0.1)),
         eval_seed=int(getattr(hparams, "cam_eval_seed", 1729)) + layer_index,
-        input_label_mode="argmax" if layer_index == 0 else "categorical",
+        input_label_mode="argmax" if layer_index == 0 or deep_gknn else "categorical",
         input_temperature=float(getattr(hparams, "cam_input_temperature", 1.0)),
+        input_gradient="gknn" if deep_gknn else None,
         **kwargs,
     )
 
@@ -217,10 +239,14 @@ class Model(pl.LightningModule):
     def configure_optimizers(self):
 #         assert(len(self.conv_layers)==1)
         
-        graph_params = set(self.conv_layers.parameters())
-        cla_params = set(self.parameters())-graph_params
-        optimizer = torch.optim.Adam([{'params': list(graph_params),'lr': self.hparams.lr_graph},\
-                                      {'params': list(cla_params),'lr': self.hparams.lr}])
+        # Deterministic parameter order (the original used sets, whose order varies
+        # between processes): same groups and learning rates, but the optimizer
+        # state can be restored when a run resumes from a checkpoint.
+        graph_params = list(self.conv_layers.parameters())
+        graph_ids = {id(p) for p in graph_params}
+        cla_params = [p for p in self.parameters() if id(p) not in graph_ids]
+        optimizer = torch.optim.Adam([{'params': graph_params,'lr': self.hparams.lr_graph},\
+                                      {'params': cla_params,'lr': self.hparams.lr}])
         
         return optimizer
     
@@ -257,6 +283,10 @@ class Model(pl.LightningModule):
         self.log('loss', loss.item(), on_step=False, on_epoch=True)
         self.log('loss_reg', loss_reg.item(), on_step=False, on_epoch=True)
         with torch.no_grad():
+            # Unweighted official-code JSD (>= 0, larger = more diverse filters);
+            # logged for every reg_type so diversity is comparable across runs.
+            self.log('jsd', torch.stack([jsd_code(x) for x in responses]).mean().item(),
+                     on_step=False, on_epoch=True)
             # share of responses < 0 (zeroed by the clamp in jsd_paper, so no gradient there)
             frac_neg = torch.stack([(x < 0).float().mean() for x in responses]).mean()
             # Monitor constant filters separately from the determinant penalty
@@ -277,10 +307,14 @@ class Model(pl.LightningModule):
             output, x1, _ = self(data)
 #             print(output.shape)
 #             print(data.y.shape)
+            # val_loss stays cross-entropy only (as in official GKNN): it drives
+            # checkpointing/early stopping and is comparable across JSD weights.
             loss = self.hparams.loss(torch.squeeze(output,-1), data.y)
             acc = 100*torch.mean( (output.argmax(-1)==data.y).float()).detach().cpu()
             self.log('val_loss', loss.item(), on_step=False, on_epoch=True)
             self.log('val_acc', acc, on_step=False, on_epoch=True)
+            self.log('val_jsd', torch.stack([jsd_code(x) for x in x1]).mean().item(),
+                     on_step=False, on_epoch=True)
  
     def test_step(self, train_batch, batch_idx):
         data=train_batch

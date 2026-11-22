@@ -610,7 +610,7 @@ class RichRecorder(pl.Callback):
         # Preserve the train metrics when Lightning finishes aggregating them,
         # even on versions that aggregate *after* validation callbacks.
         metrics={}
-        for name in ('acc','loss','loss_reg','loss_ce','frac_neg_resp',
+        for name in ('acc','loss','loss_reg','loss_ce','jsd','frac_neg_resp',
                      'frac_const_filters','corr_min_eig'):
             value=trainer.callback_metrics.get(name)
             if torch.is_tensor(value) and value.numel()==1:
@@ -642,7 +642,7 @@ class RichRecorder(pl.Callback):
                    train_batches=int(self._train_batches),
                    mean_train_batch_s=float(self._train_batch_seconds/max(self._train_batches,1)),
                    validation_epoch_s=float(self._validation_seconds))
-        for key in ('acc','loss','loss_reg','loss_ce','val_loss','val_acc',
+        for key in ('acc','loss','loss_reg','loss_ce','jsd','val_loss','val_acc','val_jsd',
                     'frac_neg_resp','frac_const_filters','corr_min_eig'):
             val=trainer.callback_metrics.get(key)
             if torch.is_tensor(val) and val.numel()==1:
