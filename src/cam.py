@@ -351,7 +351,10 @@ class CAMKernel(nn.Module):
                     egos = self._grakel_inputs(y.detach().numpy(),node_lists,edge_lists)
                     kvals_np[b:b+1] = self._evaluate([mask_traces[b]], egos)
                 input_scores = torch.stack(score_egos)  # [B,N]
-        values = torch.as_tensor(kvals_np,dtype=x.dtype,device=x.device)
+        # TU datasets give integer one-hot x (dataset.clean_graph uses .int());
+        # kernel values must stay float, as original GKernel's conv.float().
+        out_dtype = x.dtype if x.is_floating_point() else torch.float32
+        values = torch.as_tensor(kvals_np,dtype=out_dtype,device=x.device)
         mean_values = values.mean(dim=0)
         if self.training and optimize and torch.is_grad_enabled():
             if B > 1:
@@ -374,7 +377,7 @@ class CAMKernel(nn.Module):
             out = mean_values.detach()
         with torch.no_grad():
             sz = self.size_probabilities()
-            sizes = torch.as_tensor([tr.size for row in mask_traces for tr in row],dtype=x.dtype)
+            sizes = torch.as_tensor([tr.size for row in mask_traces for tr in row],dtype=out_dtype)
             self.last_diagnostics = {
                 'expected_size_per_filter': (sz * torch.arange(1,self.nodes+1,device=sz.device)[None,:]).sum(1).tolist(),
                 'mean_sampled_size': float(sizes.mean()),

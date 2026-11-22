@@ -10,5 +10,4 @@ synthetic/
 lightning_logs/
 wandb/
 data/processed/
-data/ori_dataset/
 data/raw/
